@@ -642,6 +642,9 @@ struct Layer {
           *gate_bias_vl = nullptr;   // (the image tokens' routing bias, with the vision tower)
     uint16_t* i_wproj = nullptr;
     float* gate_w = nullptr;   // the router's weights, F32 (DeepSeek's inference computes the gate in F32)
+    // (--lora) the rank-1 deltas on wo_b [0] and the shared expert's down [1]: a (the input's side), b, the scale
+    float *lr_a[2] = {nullptr, nullptr}, *lr_b[2] = {nullptr, nullptr};
+    float lr_s[2] = {0.0f, 0.0f};
     uint8_t* win = nullptr;                     // [win] rows of kKvFp8 (kv_row_bytes)
     float *c_kv = nullptr, *c_score = nullptr;  // the compressor's partial group (ratio > 1)
     // a run of chunks' mid-run checkpoint (feed_mark): the ring and the partial group as they were before a row
@@ -2357,6 +2360,7 @@ struct Model::Impl {
             CK(cudaEventCreateWithFlags(&ev_seed, cudaEventDisableTiming));
             CK(cudaEventRecord(ev_seed, devs[(size_t) d_dev].st));
         }
+        if (!o.lora.empty() && !read_lora(err)) return false;
         // the dense weights, each device's layers by a thread of its own
         {
             std::vector<std::string> errs(devs.size());
@@ -3572,6 +3576,46 @@ struct Model::Impl {
         return true;
     }
 
+    // --lora's file (tools/dsv41/lora_pack.py): "DS4L", u32 version 1, u32 count, then per delta u32 layer, u32 kind
+    // (0 attn.wo_b, 1 ffn.shared_experts.w2), u32 n_in, u32 n_out, f32 scale, f32 a[n_in], f32 b[n_out]
+    struct LoraDelta {
+        float scale = 1.0f;
+        std::vector<float> a, b;
+    };
+    std::map<std::pair<int, int>, LoraDelta> lora_h;
+    bool read_lora(std::string& err) {
+        std::FILE* f = std::fopen(o.lora.c_str(), "rb");
+        if (f == nullptr) {
+            err = "--lora " + o.lora + ": cannot open it";
+            return false;
+        }
+        auto rd = [&](void* p, size_t n) { return std::fread(p, 1, n, f) == n; };
+        char magic[4];
+        uint32_t ver = 0, n = 0;
+        bool ok = rd(magic, 4) && std::memcmp(magic, "DS4L", 4) == 0 && rd(&ver, 4) && ver == 1 && rd(&n, 4);
+        for (uint32_t i = 0; ok && i < n; ++i) {
+            uint32_t h[4];
+            LoraDelta dl;
+            ok = rd(h, sizeof h) && rd(&dl.scale, 4);
+            const int il = (int) h[0], kind = (int) h[1];
+            const uint32_t want_in = kind == 0 ? (uint32_t) (g.o_groups * g.o_lora) : (uint32_t) g.ff;
+            if (ok && (il < 0 || il >= g.nl || kind < 0 || kind > 1 || h[2] != want_in || h[3] != (uint32_t) g.dim)) {
+                err = "--lora " + o.lora + ": delta " + std::to_string(i) + " (layer " + std::to_string(il) + ", kind " +
+                      std::to_string(kind) + ", " + std::to_string(h[2]) + " -> " + std::to_string(h[3]) +
+                      ") does not fit this model";
+                std::fclose(f);
+                return false;
+            }
+            dl.a.resize(h[2]);
+            dl.b.resize(h[3]);
+            ok = ok && rd(dl.a.data(), dl.a.size() * 4) && rd(dl.b.data(), dl.b.size() * 4);
+            if (ok) lora_h[{il, kind}] = std::move(dl);
+        }
+        std::fclose(f);
+        if (!ok) err = "--lora " + o.lora + ": not a lora_pack.py file, or cut short";
+        return ok;
+    }
+
     bool load_dense(int di, std::string& err) {
         Dev& d = devs[(size_t) di];
         cudaSetDevice(d.id);
@@ -3606,6 +3650,21 @@ struct Model::Impl {
                       mat(d, P + "ffn.shared_experts.w2", l.s2, err, acct, mi, nm, false, l.il % nm) &&
                       mat(d, P + "ffn.shared_experts.w3", l.s3, err, acct, mi, nm, true, l.il % nm);
             if (!ok) return false;
+            for (int k = 0; k < 2; ++k) {
+                const auto it = lora_h.find({l.il, k});
+                if (it == lora_h.end() || l.mtp) continue;
+                if (nm > 1) {
+                    err = "--lora: layer " + std::to_string(l.il) + " is split over a tensor-parallel group (each layer on "
+                          "one GPU only)";
+                    return false;
+                }
+                const LoraDelta& dl = it->second;
+                if (!dalloc(d, l.lr_a[k], dl.a.size(), err, acct) || !dalloc(d, l.lr_b[k], dl.b.size(), err, acct))
+                    return false;
+                CK(cudaMemcpy(l.lr_a[k], dl.a.data(), dl.a.size() * 4, cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(l.lr_b[k], dl.b.data(), dl.b.size() * 4, cudaMemcpyHostToDevice));
+                l.lr_s[k] = dl.scale;
+            }
             l.sink += (size_t) l.ah0;
             for (int gi = 0; gi < l.ogn; ++gi)
                 if (!mat(d, A + "wo_a.slice." + std::to_string(l.og0 + gi), l.wo_a[gi], err, acct)) return false;
@@ -4407,6 +4466,12 @@ struct Model::Impl {
 
     std::string describe() const {
         std::ostringstream s;
+        if (!lora_h.empty()) {
+            char ll[512];
+            std::snprintf(ll, sizeof ll, "ds4: --lora: %zu rank-1 deltas on wo_b / the shared experts' down, added as the layers "
+                                         "run (%s)\n", lora_h.size(), o.lora.c_str());
+            s << ll;
+        }
         for (size_t di = 0; di < devs.size(); ++di) {
             const Dev& d = devs[di];
             int a = -1, b = -1, ev = 0, et = 0;
@@ -5125,6 +5190,7 @@ struct Model::Impl {
            << " tensors.txt:" << size_of(pk.dir + "/tensors.txt");
         for (size_t i = 0; i < pk.files.size(); ++i)
             id << " " << pk.files[i] << ":" << os::file_size(pk.fds[i]);
+        if (!o.lora.empty()) id << " lora=" << o.lora << ":" << size_of(o.lora);
         return id.str();
     }
 
@@ -6983,6 +7049,9 @@ struct Model::Impl {
                     return false;
             x3::rows_f16(c.oa, OG * g.o_lora, nullptr, na, OG * g.o_lora, c.oa16, s);
             if (!gemm(d, c, l.wo_b, c.oa16, OG * g.o_lora, na, c.acc + (size_t) a0 * D, D, 0.0f, err)) return false;
+            if (l.lr_a[0] != nullptr)
+                lora1_add(c.oa, OG * g.o_lora, OG * g.o_lora, l.lr_a[0], l.lr_b[0], l.lr_s[0], c.acc + (size_t) a0 * D, D, D,
+                          na, s);
         }
         if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
         hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
@@ -7011,6 +7080,7 @@ struct Model::Impl {
         swiglu(c.sg, c.su, T * FF, g.lim, c.sg, s);
         x3::rows_f16(c.sg, FF, nullptr, T, FF, c.sh16, s);
         if (!gemm(d, c, l.s2, c.sh16, FF, T, c.acc, D, 0.0f, err)) return false;
+        if (l.lr_a[1] != nullptr) lora1_add(c.sg, FF, FF, l.lr_a[1], l.lr_b[1], l.lr_s[1], c.acc, D, D, T, s);
         prof_mark(d, 2);
         // the expert stream's copies keep going while the device runs this layer's attention, routing and shared expert:
         // the next items (this layer's likely experts, queued when the layer before routed) go out as they are ready and
@@ -8738,6 +8808,8 @@ struct Model::Impl {
                 j[gi] = job(l.wo_a[gi], d.o + (size_t) gi * per, d.oa + (size_t) gi * g.o_lora, T, HQ, (size_t) OG * g.o_lora);
             if (!mv_n(d, j, OG, err)) return false;
             if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
+            if (l.lr_a[0] != nullptr)
+                lora1_add(d.oa, OG * g.o_lora, OG * g.o_lora, l.lr_a[0], l.lr_b[0], l.lr_s[0], d.ao, D, D, T, s);
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
@@ -8773,6 +8845,7 @@ struct Model::Impl {
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
+            if (l.lr_a[1] != nullptr) lora1_add(d.sh, FF, FF, l.lr_a[1], l.lr_b[1], l.lr_s[1], d.sh_out, D, D, T, s);
             prof_mark(d, 2);
             const x3::ExpertLayout& lay = nm > 1 ? l.hlay : l.lay;
             if (T == 1 && moe_token_path) {
@@ -8862,6 +8935,7 @@ struct Model::Impl {
         if (!mv(d, {job(l.s1, d.x, d.sg, T, D, g.ff), job(l.s3, d.x, d.su, T, D, g.ff)}, err)) return false;
         swiglu(d.sg, d.su, T * g.ff, g.lim, d.sh, s);
         if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, g.ff, D)}, err)) return false;
+        if (l.lr_a[1] != nullptr) lora1_add(d.sh, g.ff, g.ff, l.lr_a[1], l.lr_b[1], l.lr_s[1], d.sh_out, D, D, T, s);
         const double tw = now_ms();
         CK(cudaEventSynchronize(d.ev));
         st.gpu_wait_ms += now_ms() - tw;

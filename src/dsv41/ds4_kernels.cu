@@ -1897,6 +1897,23 @@ void hc_post(const float* y, const float* res, const float* post, const float* c
     hc_post_kernel<<<dim3(cdiv(dim * hc, kThreads), T), kThreads, 0, s>>>(y, res, post, comb, dim, hc, out);
 }
 
+namespace {
+__global__ void __launch_bounds__(kThreads) lora1_add_kernel(const float* __restrict__ x, int ldx, int n_in,
+                                                            const float* __restrict__ a, const float* __restrict__ b,
+                                                            float scale, float* y, int ldy, int n_out) {
+    const float* xr = x + (size_t) blockIdx.x * ldx;
+    float v = 0.0f;
+    for (int i = threadIdx.x; i < n_in; i += blockDim.x) v = fmaf(xr[i], a[i], v);
+    const float d = scale * block_sum(v);
+    float* yr = y + (size_t) blockIdx.x * ldy;
+    for (int r = threadIdx.x; r < n_out; r += blockDim.x) yr[r] = fmaf(d, b[r], yr[r]);
+}
+}  // namespace
+void lora1_add(const float* x, int ldx, int n_in, const float* a, const float* b, float scale, float* y, int ldy,
+               int n_out, int T, cudaStream_t s) {
+    if (T > 0) lora1_add_kernel<<<T, kThreads, 0, s>>>(x, ldx, n_in, a, b, scale, y, ldy, n_out);
+}
+
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s) {
     hc_post_inplace_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(y, h, post, comb, dim, hc);

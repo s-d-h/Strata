@@ -30,6 +30,9 @@ struct Options {
     double vram_experts = 1.0;        // the share of the expert budget to use (tests: less, so the CPU lane works)
     int cpu_threads = 0;              // 0: the physical cores
     std::string profile;              // expert hit counts (read to place the hottest experts in VRAM, written back)
+    // a rank-1 LoRA's deltas on attn.wo_b / ffn.shared_experts.w2 (tools/dsv41/lora_pack.py's file), added to those
+    // matrices' outputs as the layers run: the base pack's weights stay as they are (empty: none)
+    std::string lora;
     bool expert_cache = true;         // experts move between VRAM and the CPU lane as they are used
     // the CPU lane's experts read in place from the model's files, the page cache keeping what fits, instead of
     // copied into RAM: 1 on, 0 off, -1 (auto) where the RAM this process can get does not hold them

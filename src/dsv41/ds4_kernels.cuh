@@ -86,6 +86,10 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 /// inference computes them (linear(x.float(), weight.float())) - a warp a row, the same summing order for any T, so
 /// the token, window and chunk paths get the same bits.
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
+/// y[t ldy + r] += scale b[r] (a . x[t]) for T rows: a rank-1 LoRA's delta on a matrix's output (x [T][n_in] ldx apart),
+/// a block a row - the same summing order for any T, so the token, window and chunk paths get the same bits
+void lora1_add(const float* x, int ldx, int n_in, const float* a, const float* b, float scale, float* y, int ldy,
+               int n_out, int T, cudaStream_t s);
 
 /// The router, row t: scores = sqrt(softplus(logits[t])) (n experts, rows 1024 apart), the top `k` of scores + bias;
 /// weights from the unbiased scores, normalized to sum 1 (+1e-20) and times route_scale -> idx[t][i], w[t][i] (rows

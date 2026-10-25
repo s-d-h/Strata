@@ -573,6 +573,7 @@ struct Chunk {
         int64_t after = -1;                            // (layer-major) the items up to this one read first
         std::atomic<int> left{0};                      // parts still being read
         std::atomic<bool> bad{false};
+        uint8_t via = 0;                               // (the dual-link prompt) 1: copied in through the other GPU
     };
     bool flow = false;
     int dev = -1;                            // the device (index into devs) this chunk state belongs to
@@ -850,6 +851,12 @@ struct Model::Impl {
             for (size_t i = c.base; i < c.n_read; ++i)
                 while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_any(500);
         if (c.cs != nullptr) cudaStreamSynchronize(c.cs);
+        if (!dual.empty()) {
+            cudaSetDevice(devs[(size_t) dual[(size_t) di]->helper].id);
+            cudaStreamSynchronize(dual[(size_t) di]->s_in);
+            cudaSetDevice(devs[(size_t) di].id);
+            cudaStreamSynchronize(dual[(size_t) di]->pull);
+        }
         cudaStreamSynchronize(devs[(size_t) di].st);
         err = kHalted;
         return false;
@@ -1028,6 +1035,34 @@ struct Model::Impl {
     std::vector<uint8_t*> ram_slots, ram_chunks;
     std::vector<size_t> ram_chunk_bytes;
     bool ram_pinned = false;   // the slots are pinned memory (the prompt path DMAs them from where they lie)
+    // (copy_mode, the dual-link prompt) the copies pinned as well: the prompt path DMAs them from where they lie - the
+    // other GPU's link can read them only so
+    std::vector<void*> copy_reg;
+    bool copy_pinned = false;
+    // THE DUAL-LINK PROMPT (DS4_DUAL_LINK=1: two GPUs, every layer on the flow, the CPU lane's experts copied into RAM,
+    // peer access): in a run of one chunk the GPUs' layers run one after the other, so while one streams its CPU-lane
+    // experts the other's PCIe link idles - every second item of a GPU's stream goes host -> the other GPU's VRAM over
+    // THAT GPU's link, then pulled peer to peer into this GPU's ring over NVLink by this GPU, so a layer's experts
+    // arrive through both links (Project Maya's GLM dual-link prompt, glm_prefill.cu, MIT, ported to the flow).  The
+    // other GPU only lands the host copies (its copy engine): its own half's first kernel - the hand-off's wait - spins
+    // there all the while, and peer copies it pushed hung behind that.  dual[di]: GPU di's state - two landing slots
+    // and the host copies' stream on the other GPU with their events (in_done), the pulls' stream on di with theirs
+    // (out_done: a landing slot free again) and the fill event of each ring slot they wrote (di's compute waits on
+    // those as on ring_fill)
+    struct DualLink {
+        int helper = -1;
+        uint8_t* buf[2] = {nullptr, nullptr};
+        cudaStream_t s_in = nullptr, pull = nullptr;
+        cudaEvent_t in_done[2] = {}, out_done[2] = {};
+        std::vector<cudaEvent_t> fill;
+        uint64_t n = 0, run_items = 0;
+    };
+    std::vector<std::unique_ptr<DualLink>> dual;   // (empty: off)
+    bool dual_run = false;                         // the run going through the layers is one chunk: dual-link
+    static bool dual_want() {
+        static const bool w = std::getenv("DS4_DUAL_LINK") != nullptr && std::atoi(std::getenv("DS4_DUAL_LINK")) != 0;
+        return w;
+    }
     size_t flow_part[3] = {0, 0, 0};   // the flow's staging room for each part: its largest over the trunk's layers
     std::vector<int> ram_free;
     std::deque<RamSwap> ram_queue;
@@ -1262,6 +1297,7 @@ struct Model::Impl {
         for (std::thread& t : cache_ths)
             if (t.joinable()) t.join();
         if (ram_th.joinable()) ram_th.join();
+        for (void* m : copy_reg) cudaHostUnregister(m);
         for (size_t i = 0; i < ram_chunks.size(); ++i) os::anon_free(ram_chunks[i], ram_chunk_bytes[i]);
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
@@ -2714,6 +2750,7 @@ struct Model::Impl {
                 bool all_flow = true;
                 for (const auto& cp : chunks) all_flow = all_flow && (cp == nullptr || cp->ring == nullptr || cp->flow);
                 if (all_flow && std::getenv("DS4_CHUNK_MIN") == nullptr) chunk_min = kFlowChunkMin;
+                if (!dual_setup(err)) return false;
             }
             for (Layer& l : L) {
                 if (l.mtp) continue;
@@ -3187,6 +3224,12 @@ struct Model::Impl {
                 in_ram = true;
             }
         }
+        if (in_ram && copy_pinned && copy_mode && store_blob == nullptr) {   // (a pinned copy: DMA'd from where it lies)
+            for (int r = 0; r < 3; ++r)
+                it.src[r] = ram_part[(size_t) l.ram[(size_t) e]][0] + cp_lay[(size_t) l.il][(size_t) r] + mx_read_off(l, mi, r);
+            ++c.it_ram;
+            return;
+        }
         if (in_ram && ram_pinned && store_blob == nullptr) {   // (DMA'd from where it lies)
             const uint8_t* p = ram_slots[(size_t) l.ram[(size_t) e]];
             for (int r = 0; r < 3; ++r) it.src[r] = p + l.lay.trellis[r] + mx_read_off(l, mi, r);
@@ -3418,6 +3461,11 @@ struct Model::Impl {
                 return false;
             }
             const size_t r = c.n_dma % R;
+            if (dual_run && it.stage < 0 && (c.n_dma & 1) != 0) {   // (the dual-link prompt: the other GPU's link)
+                if (!dual_copy(c, it, r, err)) return false;
+                ++c.n_dma;
+                continue;
+            }
             if (c.n_dma >= R) CK(cudaStreamWaitEvent(c.cs, c.ring_free[r], 0));
             const Layer& l = L[(size_t) it.il];
             uint8_t* dst = c.ring + r * c.ring_stride;
@@ -3477,8 +3525,15 @@ struct Model::Impl {
             // (the items' virtual slots ascend and the slots between them have no rows: their bounds side by side)
             for (int m = 0; m < n; ++m) bc[m] = b[(size_t) fit(c, i0 + (size_t) m).v];
             bc[n] = b[(size_t) fit(c, i1 - 1).v + 1];
+            if (dual_run) {   // (two copy queues: the batch's last item of each landed - with or without rows, so that
+                              // its ring_free, which the slots' next copies on either queue wait for, follows both)
+                size_t own = SIZE_MAX, via = SIZE_MAX;
+                for (size_t i = i0; i < i1; ++i) (fit(c, i).via ? via : own) = i;
+                if (own != SIZE_MAX) CK(cudaStreamWaitEvent(s, c.ring_fill[own % R], 0));
+                if (via != SIZE_MAX) CK(cudaStreamWaitEvent(s, dual[(size_t) c.dev]->fill[via % R], 0));
+            }
             if (bc[n] > bc[0]) {
-                CK(cudaStreamWaitEvent(s, c.ring_fill[(i1 - 1) % R], 0));
+                if (!dual_run) CK(cudaStreamWaitEvent(s, c.ring_fill[(i1 - 1) % R], 0));
                 CK(cudaMemcpyAsync(bcd, bc, (size_t) (n + 1) * 4, cudaMemcpyHostToDevice, s));
                 if (!run_set(d, c, L0, c.ring + (i0 % R) * c.ring_stride, 0, c.ring_stride, bcd, bc, 0, n, T, err))
                     return false;
@@ -4208,9 +4263,116 @@ struct Model::Impl {
     // hottest n GB (the static hybrid, for tests).  Each copy in NH parts on the NUMA nodes (DS4_COPY_NUMA=1: one), read from the files in file
     // order by a few threads, anonymous memory on huge pages (Windows: plain), not pinned (only the CPU reads it; what
     // goes to a GPU passes the pinned staging) - a layer that cannot get its memory keeps its experts in place
+    // the dual-link prompt's setup (DS4_DUAL_LINK=1), once the rings are in: peer access both ways, a 4 MB pattern each
+    // way through it (a driver can report peer access a platform does not carry: Project Maya saw two V100s behind a
+    // host bridge take the copies and deliver 99.6% of the bytes wrong), then each GPU's state for the other's stream
+    bool dual_setup(std::string& err) {
+        if (!dual_want()) return true;
+        bool fit = devs.size() == 2 && chunks.size() == 2 && copy_pinned;
+        for (const auto& cp : chunks) fit = fit && cp != nullptr && cp->flow && cp->ring != nullptr;
+        for (const Layer& l : L) fit = fit && l.nm == 1;
+        if (!fit) {
+            err = "DS4_DUAL_LINK=1: needs two GPUs, each layer on one of them, every layer on the flow and the CPU lane's "
+                  "experts copied into RAM (--mmap-experts off)";
+            return false;
+        }
+        for (int a = 0; a < 2; ++a) {
+            int ok = 0;
+            CK(cudaDeviceCanAccessPeer(&ok, devs[(size_t) a].id, devs[(size_t) (1 - a)].id));
+            if (!ok) {
+                err = "DS4_DUAL_LINK=1: CUDA" + std::to_string(devs[(size_t) a].id) + " cannot reach CUDA" +
+                      std::to_string(devs[(size_t) (1 - a)].id) + "'s memory";
+                return false;
+            }
+            CK(cudaSetDevice(devs[(size_t) a].id));
+            const cudaError_t pe = cudaDeviceEnablePeerAccess(devs[(size_t) (1 - a)].id, 0);
+            (void) cudaGetLastError();
+            if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) CK(pe);
+        }
+        {
+            const size_t nb = (size_t) 4 << 20;
+            std::vector<uint8_t> pat(nb), got(nb);
+            for (size_t i = 0; i < nb; ++i) pat[i] = (uint8_t) ((i * 2654435761u) >> 13);
+            void* m[2] = {nullptr, nullptr};
+            bool same = true;
+            for (int a = 0; a < 2; ++a) {
+                CK(cudaSetDevice(devs[(size_t) a].id));
+                CK(cudaMalloc(&m[a], nb));
+            }
+            for (int a = 0; a < 2 && same; ++a) {
+                const int b = 1 - a;
+                CK(cudaSetDevice(devs[(size_t) a].id));
+                CK(cudaMemcpy(m[a], pat.data(), nb, cudaMemcpyHostToDevice));
+                CK(cudaMemcpyPeer(m[b], devs[(size_t) b].id, m[a], devs[(size_t) a].id, nb));
+                CK(cudaSetDevice(devs[(size_t) b].id));
+                CK(cudaMemcpy(got.data(), m[b], nb, cudaMemcpyDeviceToHost));
+                same = std::memcmp(got.data(), pat.data(), nb) == 0;
+            }
+            for (int a = 0; a < 2; ++a) {
+                cudaSetDevice(devs[(size_t) a].id);
+                cudaFree(m[a]);
+            }
+            if (!same) {
+                err = "DS4_DUAL_LINK=1: a peer copy between the GPUs came out wrong on this machine";
+                return false;
+            }
+        }
+        dual.resize(2);
+        for (int di = 0; di < 2; ++di) {
+            auto h = std::make_unique<DualLink>();
+            h->helper = 1 - di;
+            Dev& hd = devs[(size_t) h->helper];
+            const Chunk& c = *chunks[(size_t) di];
+            for (auto& b : h->buf)
+                if (!dalloc(hd, b, c.ring_stride, err)) return false;
+            CK(cudaSetDevice(hd.id));   // (the host copies' stream and events: the other GPU's)
+            CK(cudaStreamCreateWithFlags(&h->s_in, cudaStreamNonBlocking));
+            for (int j = 0; j < 2; ++j) CK(cudaEventCreateWithFlags(&h->in_done[j], cudaEventDisableTiming));
+            CK(cudaSetDevice(devs[(size_t) di].id));   // (the pulls': this GPU's)
+            CK(cudaStreamCreateWithFlags(&h->pull, cudaStreamNonBlocking));
+            for (int j = 0; j < 2; ++j) CK(cudaEventCreateWithFlags(&h->out_done[j], cudaEventDisableTiming));
+            h->fill.resize((size_t) c.ring_n);
+            for (cudaEvent_t& e : h->fill) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            dual[(size_t) di] = std::move(h);
+        }
+        CK(cudaSetDevice(devs[0].id));
+        std::fprintf(stderr, "ds4: dual-link prompt on (DS4_DUAL_LINK): in a run of one chunk every second streamed expert "
+                             "comes through the other GPU's PCIe link and NVLink\n");
+        return true;
+    }
+    // (the dual-link prompt) item `it` into ring slot r of its GPU through the other: that GPU's link copies the expert's
+    // parts from where they lie (pinned) into a landing slot of its own, then this GPU pulls it over NVLink into the
+    // ring - after the slot's last use, as its own copies go
+    bool dual_copy(Chunk& c, Chunk::Item& it, size_t r, std::string& err) {
+        DualLink& h = *dual[(size_t) c.dev];
+        const Layer& l = L[(size_t) it.il];
+        const x3::ExpertLayout& lay = l.lay;
+        CK(cudaSetDevice(devs[(size_t) h.helper].id));
+        const int j = (int) (h.n & 1);
+        if (h.n >= 2) CK(cudaStreamWaitEvent(h.s_in, h.out_done[j], 0));   // (the landing slot's last pull is done)
+        ++h.n;
+        uint8_t* hb = h.buf[j];
+        for (int q = 0; q < 2; ++q)
+            CK(cudaMemcpyAsync(hb + lay.trellis[q], it.src[q], mx_read_len(l, q), cudaMemcpyHostToDevice, h.s_in));
+        CK(cudaMemcpyAsync(hb + lay.trellis[2], it.src[2], mx_part_bytes(l, 2), cudaMemcpyHostToDevice, h.s_in));
+        CK(cudaEventRecord(h.in_done[j], h.s_in));
+        CK(cudaSetDevice(devs[(size_t) c.dev].id));
+        CK(cudaStreamWaitEvent(h.pull, h.in_done[j], 0));
+        if (c.n_dma >= (size_t) c.ring_n) CK(cudaStreamWaitEvent(h.pull, c.ring_free[r], 0));
+        CK(cudaMemcpyPeerAsync(c.ring + r * c.ring_stride, devs[(size_t) c.dev].id, hb, devs[(size_t) h.helper].id, unit(l),
+                               h.pull));
+        CK(cudaEventRecord(h.out_done[j], h.pull));
+        CK(cudaEventRecord(h.fill[r], h.pull));
+        it.via = 1;
+        ++h.run_items;
+        c.stream_bytes += (double) unit(l);
+        return true;
+    }
+
     bool copy_experts(const std::vector<std::pair<int, int>>& hot, std::string& err) {
         if (o.mmap_experts > 0 || hot.empty()) return true;
         const double t0 = now_ms();
+        const size_t chunk0 = ram_chunks.size();   // (the chunks this copy maps: what copy_pinned registers)
         auto spare_of = [&](const Layer& l) { return o.expert_cache && l.spare_vram >= 0 ? 1 : 0; };
         double all = 0;
         {
@@ -4342,6 +4504,22 @@ struct Model::Impl {
         for (const Job& j : jobs) L[(size_t) j.layer].ram[(size_t) j.e] = j.slot;
         copy_mode = true;
         ram_held = (int) jobs.size();
+        if (chunk > 0 && NH == 1 && dual_want()) {
+            const double tp = now_ms();
+            double pb = 0;
+            for (size_t i = chunk0; i < ram_chunks.size(); ++i) {
+                if (cudaHostRegister(ram_chunks[i], ram_chunk_bytes[i], cudaHostRegisterPortable) != cudaSuccess) {
+                    err = "pinning the CPU lane's copied experts for the dual-link prompt (" +
+                          std::to_string(ram_chunk_bytes[i] >> 20) + " MiB) failed: " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                copy_reg.push_back(ram_chunks[i]);
+                pb += (double) ram_chunk_bytes[i];
+            }
+            copy_pinned = !copy_reg.empty();
+            std::fprintf(stderr, "ds4: the copies pinned for the dual-link prompt (%.1f GB in %.1f s)\n", pb / 1e9,
+                         (now_ms() - tp) / 1000.0);
+        }
         double cb = 0;
         for (const Job& j : jobs) cb += (double) L[(size_t) j.layer].blob;
         std::fprintf(stderr, "ds4: %zu of the CPU lane's %zu experts copied into RAM (%.1f GB, %d NUMA part%s) in %.1f s%s\n",
@@ -7403,6 +7581,13 @@ struct Model::Impl {
         if (c.flow) {   // (the flow decides its streams as the layers route; nothing planned here)
             CK(cudaStreamSynchronize(s));
             CK(cudaStreamSynchronize(c.cs));
+            if (!dual.empty()) {   // (the dual-link prompt's copies for this GPU: the other's host copies, its pulls)
+                const DualLink& h = *dual[(size_t) di];
+                CK(cudaSetDevice(devs[(size_t) h.helper].id));
+                CK(cudaStreamSynchronize(h.s_in));
+                CK(cudaSetDevice(d.id));
+                CK(cudaStreamSynchronize(h.pull));
+            }
             c.items.clear();
             c.base = c.n_read = c.n_dma = c.n_comp = 0;
             c.n_file = 0;
@@ -7508,6 +7693,13 @@ struct Model::Impl {
                         init_pre(c.pre, T, s);
                     } else {
                         Chunk& a = *chunks[(size_t) L[(size_t) il - 1].dev];
+                        // (the dual-link prompt: the hand-off awaited on the host first - with a kernel spinning for it on this
+                        // GPU while the other GPU's thread enqueues its copies here, the run deadlocked: a cuBLAS module that
+                        // loads meanwhile (lazily, at its first use) waits for this GPU with its context held, and the other
+                        // thread's next call into this context waits for that)
+                        if (dual_run)
+                            while ((int) (*(volatile const unsigned*) a.hand_flag[slot] - wp.win) < 0)
+                                std::this_thread::sleep_for(std::chrono::microseconds(50));
                         xfer_get(chunk_xfer(a.hand[slot], c, T, false), a.hand_flag[slot], wp.win, s);
                         set_flag(a.hand_ack + ((size_t) slot * 8 + mi) * 32, wp.win, s);
                     }
@@ -7792,7 +7984,7 @@ struct Model::Impl {
             f_cold += (1.0 - share) * u(n) * b;
             w += ((double) nw * u(kWin) + (rem > 0 ? u(rem) : 0.0)) * b;
         }
-        const double r_fr = std::min(pm.copy, pm.dma), r_fc = pm.disk > 0 ? std::min(pm.disk, pm.dma) : r_fr;
+        const double r_fr = copy_pinned ? pm.dma : std::min(pm.copy, pm.dma), r_fc = pm.disk > 0 ? std::min(pm.disk, pm.dma) : r_fr;
         const double r_wc = pm.cpu_cold > 0 ? pm.cpu_cold : 1.0 / (1.0 / r_fc + 1.0 / pm.cpu);
         const double t_flow = f_res / r_fr + f_cold / r_fc;
         const double t_win = std::max(0.0, w - f_cold) / pm.cpu + f_cold / r_wc;
@@ -8046,6 +8238,8 @@ struct Model::Impl {
             halt_seen = -1;
         }
         bool halting = false;
+        dual_run = !dual.empty() && run.T.size() == 1;
+        for (auto& h : dual) h->run_items = 0;
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, &run, &errs] {
                 std::string e;
@@ -8160,18 +8354,21 @@ struct Model::Impl {
                 const double db = (double) (c.io->direct_bytes() - c.io_d0) / 1e9;
                 const double bb = (double) (c.io->buffered_bytes() - c.io_b0) / 1e9;
                 const double fb = db + bb, rb = (double) c.it_ram * (double) L[0].blob / 1e9;   // (a member: its parts)
-                char lcs[160] = "";
+                char lcs[160] = "", dls[96] = "";
+                if (dual_run)
+                    std::snprintf(dls, sizeof dls, ", %llu of them through CUDA%d's link (dual-link)",
+                                  (unsigned long long) dual[di]->run_items, devs[(size_t) dual[di]->helper].id);
                 if (c.lm)
                     std::snprintf(lcs, sizeof lcs, ", %llu again from the layer cache (layer-major, %d chunks, %.1f GB "
                                   "of RAM)", (unsigned long long) c.it_lc, (int) run.T.size(), (double) c.lc_bytes / 1e9);
                 std::fprintf(stderr,
                              "ds4 prompt stream, CUDA%d: %d tokens in %.0f ms; %llu experts streamed: %llu from the files "
                              "(%.1f GB, %.2f GB/s: %.1f GB from the disk unbuffered, %.1f GB through the page cache), %llu "
-                             "from RAM (%.1f GB)%s; %llu likely ones queued early, %llu of them unpicked; the compute waited "
+                             "from RAM (%.1f GB)%s%s; %llu likely ones queued early, %llu of them unpicked; the compute waited "
                              "%.0f ms for reads\n",
                              devs[di].id, n, ms, (unsigned long long) (c.it_file + c.it_ram + c.it_lc),
                              (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
-                             (unsigned long long) c.it_ram, rb, lcs, (unsigned long long) c.it_spec,
+                             (unsigned long long) c.it_ram, rb, lcs, dls, (unsigned long long) c.it_spec,
                              (unsigned long long) c.it_spec_unused, c.wait_ms);
             }
         }

@@ -65,6 +65,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import ds4_vision  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
 
@@ -4755,6 +4756,8 @@ class Service:
         the control tokens the template writes are control tokens.  `store=False` (a token count) reuses the kept
         prompts without adding or replacing one."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
+        if self.family == "deepseek41" and ds4_vision.PLACEHOLDER not in self.template.source:
+            marked = ds4_vision.placeholders(marked)   # a template that takes text only: the image items as placeholders
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         plain = ()
         if changed:
@@ -4803,9 +4806,12 @@ class Service:
                             raise ValueError("offline mode cannot download an image URL")
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
-                        with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
-                            self._vision_up()         # an elastic encoder is not running until a picture needs it
-                            self.vision.encode(src)
+                        if isinstance(self.vision, ds4_vision.Vision):
+                            self.vision.picture(src)  # DeepSeek: read and resized here, the engine encodes it
+                        else:
+                            with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
+                                self._vision_up()     # an elastic encoder is not running until a picture needs it
+                                self.vision.encode(src)
                     except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
                         why = str(e)
                 if why is not None:
@@ -4831,7 +4837,21 @@ class Service:
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
-        if images:
+        pictures = None                                 # DeepSeek's: (resized pictures, their spans' starts)
+        if images and isinstance(self.vision, ds4_vision.Vision):
+            if self.offline and any(src.startswith(("http://", "https://")) for src in images):
+                raise ValueError("offline mode cannot download an image URL; send a data: image instead")
+            # DeepSeek-V4.1: the engine runs the vision tower itself, so nothing is encoded here and nothing takes the
+            # engine's turn - each placeholder becomes its picture's span, the resized pixels go in the GENI file
+            pics = []
+            for src in images:
+                if cancel is not None and cancel.is_set():
+                    raise ClientGone()
+                pics.append(self.vision.picture(fetched[src] if src in fetched else Vision.download(src)
+                                                if src.startswith(("http://", "https://")) else src))
+            ids, starts = self.vision.expand(ids, pics)
+            pictures = (pics, starts)
+        elif images:
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
                 raise ValueError("offline mode cannot download an image URL; send a data: image instead")
             if self.vision is None:
@@ -4907,7 +4927,12 @@ class Service:
             print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves that much "
                   f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
             max_new = max(1, room)          # a shorter completion beats a 400 (the default)
-        if images:
+        if pictures is not None:
+            # (written here for the reason below; no picture keys: the engine matches its spans by their ids)
+            path = combined_embeddings_path(self.vision.dir, sum(len(p.rgb) for p in pictures[0]))
+            self.embeddings.path = path
+            self.vision.write(path, *pictures)
+        elif images:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
@@ -8418,6 +8443,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
+        if vision is None and engine.info.get("vision") == "ds4":
+            # DeepSeek-V4.1: the engine's own vision tower (the pack's, from DeepSeek's checkpoint); the server resizes
+            # the pictures.  (A lazy start has no INFO yet: pictures stay off there.)
+            vision = ds4_vision.Vision(ds4_vision.Geometry.from_info(engine.info),
+                                       Path(tempfile.mkdtemp(prefix="strata-ds4-pictures-")), Vision.load)
+            print(f"[strata] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}, "
+                  f"{engine.info.get('vision_mib')} MiB), up to {vision.g.max_tokens} tokens a picture", flush=True)
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups else None
         if note:                                        # #560 #516: before --open starts a browser on that card

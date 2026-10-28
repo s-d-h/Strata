@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import io
 import math
+import shutil
 import struct
 import threading
 from dataclasses import dataclass
@@ -149,7 +150,7 @@ def prepare(data: bytes, g: Geometry) -> Picture:
 class Vision:
     """The server's side of strata-dsv41's pictures: the resize (cached by the picture's bytes: a conversation sends
     its pictures with every turn) and the GENI file.  Not an encoder process: the Service's encoder hooks (alive,
-    elastic, restart, unload) find none of theirs and leave it alone."""
+    elastic, restart, unload) find none of theirs and leave it alone; the server's stop calls shutdown()."""
 
     def __init__(self, geometry: Geometry, directory: Path, load):
         self.g, self.dir, self._load = geometry, Path(directory), load
@@ -187,6 +188,10 @@ class Vision:
         if k != len(pictures):
             raise ValueError("the prompt and its images do not match")
         return out, starts
+
+    def shutdown(self):
+        """The server ends: the GENI files' directory (its own mkdtemp each start) goes with it."""
+        shutil.rmtree(self.dir, ignore_errors=True)
 
     def write(self, path: Path, pictures: list[Picture], starts: list[int]) -> Path:
         with open(path, "wb") as f:

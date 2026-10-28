@@ -784,6 +784,13 @@ class Pictures(ApiBase):
     resized pixels in a DSI1 file (serve/ds4_vision.py)."""
     IMAGE = 9                                           # <｜deepseek_image｜> in mini_tokenizer
 
+    def test_shutdown_removes_the_directory(self):
+        # The server's stop calls vision.shutdown(): without it the stop raised AttributeError and exited 1.
+        d = Path(tempfile.mkdtemp(prefix="strata-test-ds4-"))
+        (d / "x.geni").write_bytes(b"")
+        ds4_vision.Vision(ds4_vision.Geometry(image_token=self.IMAGE), d, server.Vision.load).shutdown()
+        self.assertFalse(d.exists())
+
     def start(self, script, template=TEMPLATE):
         tok = self.tok
         engine = PictureEngine(tok, script)

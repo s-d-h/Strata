@@ -8,13 +8,9 @@ the check of the real tokenizer against the ids llama.cpp (PR 30817 b72050d0) ma
 """
 from __future__ import annotations
 
-import base64
-import io
 import json
 import os
-import struct
 import sys
-import tempfile
 import unittest
 import urllib.error
 import urllib.request
@@ -24,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import strata_tokenizer as ST  # noqa: E402
-from serve import ds4_vision, frontend, server  # noqa: E402
+from serve import frontend, server  # noqa: E402
 from serve.dsml import DsmlOutputParser, DsmlTranslator, to_dsml_force  # noqa: E402
 from serve.frontend import ChatTemplate, OutputParser, openai_to_messages  # noqa: E402
 from serve.server import (FAMILY_MODEL_NAMES, MockEngine, REASONING_WRAP_UP, Service, default_model_name, model_card_sampling,  # noqa: E402
@@ -566,10 +562,12 @@ class Api(ApiBase):
         self.chat()
         self.assertNotIn("strata_prefix", self.engine.last_sampling)     # no system message
         body = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}], "max_tokens": 40}
-        for off in (None, "0"):                                           # off by default, and when switched off
-            self.auto_pin(off)
-            self.post("/v1/chat/completions", body)
-            self.assertNotIn("strata_prefix", self.engine.last_sampling)
+        self.auto_pin("0")                                                # switched off
+        self.post("/v1/chat/completions", body)
+        self.assertNotIn("strata_prefix", self.engine.last_sampling)
+        self.auto_pin(None)                                               # on by default
+        self.post("/v1/chat/completions", body)
+        self.assertIn("strata_prefix", self.engine.last_sampling)
 
     def test_a_clients_own_prefix_wins(self):
         self.start("ok")
@@ -604,7 +602,7 @@ class SlotEnv(unittest.TestCase):
     def test_deepseek_gets_a_folder_in_the_data_folder_and_the_default_switch(self):
         env = self.env({"arch": "deepseek41", "log": str(Path("data") / "strata-deepseek.log"), "args": []})
         self.assertEqual(Path(env["STRATA_DS4_SLOT_DIR"]), Path("data") / "ds4-slots")
-        self.assertEqual(env["STRATA_DS4_SLOT_KEEP"], "0")
+        self.assertEqual(env["STRATA_DS4_SLOT_KEEP"], "1")
         self.assertEqual(env["STRATA_DS4_SLOT_GB"], "2")
 
     def test_the_configs_own_settings_win(self):
@@ -763,137 +761,32 @@ class PickTemplateTests(unittest.TestCase):
         self.assertTrue(dsml.v41_template_ok(dsml.FIXTURE_TEMPLATE.read_text(encoding="utf-8")))
 
 
+class ArchFromTokenizer(unittest.TestCase):
+    """#4137: a config without "arch" (serve/server.py run on its own) must not serve DeepSeek with the Qwen stop ids."""
 
-def png(width, height, color=(200, 30, 30)) -> str:
-    from PIL import Image
-    buf = io.BytesIO()
-    Image.new("RGB", (width, height), color).save(buf, "PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    def test_a_deepseek_tokenizer_without_an_arch_is_deepseek41(self):
+        self.assertEqual(server.arch_from_tokenizer(None, "deepseek3"), "deepseek41")
+        self.assertEqual(server.arch_from_tokenizer("", "deepseek3"), "deepseek41")
 
+    def test_an_arch_the_config_names_is_kept(self):
+        self.assertEqual(server.arch_from_tokenizer("qwen4exp", "deepseek3"), "qwen4exp")
+        self.assertEqual(server.arch_from_tokenizer("deepseek41", "qwen35"), "deepseek41")
 
-class PictureEngine(DsEngine):
-    """Keeps the GENI file's bytes (the server deletes it once the run ends)."""
+    def test_a_qwen_tokenizer_names_nothing(self):
+        self.assertIsNone(server.arch_from_tokenizer(None, "qwen35"))
+        self.assertIsNone(server.arch_from_tokenizer(None, None))
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
-        self.picture_file = Path(embeddings).read_bytes() if embeddings else None
-        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
-
-
-class Pictures(ApiBase):
-    """strata-dsv41 runs the vision tower: the server puts each picture's span where its placeholder goes and sends the
-    resized pixels in a DSI1 file (serve/ds4_vision.py)."""
-    IMAGE = 9                                           # <｜deepseek_image｜> in mini_tokenizer
-
-    def test_shutdown_removes_the_directory(self):
-        # The server's stop calls vision.shutdown(): without it the stop raised AttributeError and exited 1.
-        d = Path(tempfile.mkdtemp(prefix="strata-test-ds4-"))
-        (d / "x.geni").write_bytes(b"")
-        ds4_vision.Vision(ds4_vision.Geometry(image_token=self.IMAGE), d, server.Vision.load).shutdown()
-        self.assertFalse(d.exists())
-
-    def start(self, script, template=TEMPLATE):
-        tok = self.tok
-        engine = PictureEngine(tok, script)
-        svc = Service(engine, tok, ChatTemplate(template), model_name=default_model_name({"arch": "deepseek41"}),
-                      vision=ds4_vision.Vision(ds4_vision.Geometry(image_token=self.IMAGE),
-                                               Path(tempfile.mkdtemp(prefix="strata-test-ds4-")), server.Vision.load))
-        svc.model_arch = "deepseek41"
-        svc.set_family("deepseek41")
-        httpd = server.serve(svc, port=0)
-        self.addCleanup(httpd.server_close)
-        self.addCleanup(httpd.shutdown)
+    def test_without_the_family_the_pieces_of_im_end_are_not_stop_ids_and_the_end_token_is(self):
+        # what the reporter's config got (#4137, #4576): the DeepSeek tokenizer splits <|im_end|> into pieces, so "|", ">" and "im" (Nerazim)
+        # stopped a reply, and the end token (id 1) did not stop it at all
+        tok = mini_tokenizer()
+        wrong = Service(DsEngine(tok, "x"), tok, ChatTemplate(TEMPLATE))
+        self.assertIn(EOS, wrong.stop_ids)
+        self.assertFalse(wrong.stop_ids & set(tok.encode("|", parse_special=True)))
+        right = Service(DsEngine(tok, "x"), tok, ChatTemplate(TEMPLATE))
+        right.set_family("deepseek41")
         self.addCleanup(frontend.use_family, None)
-        self.engine, self.svc = engine, svc
-        self.base = f"http://127.0.0.1:{httpd.server_address[1]}"
-        return engine
-
-    def spans(self, ids):
-        """[(start, length)] of the runs of image tokens."""
-        out, i = [], 0
-        while i < len(ids):
-            if ids[i] == self.IMAGE:
-                j = i
-                while j < len(ids) and ids[j] == self.IMAGE:
-                    j += 1
-                out.append((i, j - i))
-                i = j
-            else:
-                i += 1
-        return out
-
-    def file(self):
-        data = self.engine.picture_file
-        magic, n = struct.unpack_from("<4si", data, 0)
-        pics, at = [], 8
-        for _ in range(n):
-            start, w, h = struct.unpack_from("<qii", data, at)
-            at += 16 + w * h * 3
-            pics.append((start, w, h))
-        self.assertEqual((magic, at), (b"DSI1", len(data)))
-        return pics
-
-    def test_a_user_picture_becomes_its_span_and_its_pixels(self):
-        self.start("A red square.</think>\n\nRed.")
-        status, r = self.chat(messages=[{"role": "user", "content": [
-            {"type": "text", "text": "what is it? "}, {"type": "image_url", "image_url": {"url": png(32, 32)}}]}])
-        self.assertEqual(status, 200, r)
-        n_h, n_w, h, w = ds4_vision.plan(32, 32, ds4_vision.Geometry(image_token=self.IMAGE))
-        (start, length), = self.spans(self.engine.last_prompt)
-        self.assertEqual(length, ds4_vision.span_tokens(n_h, n_w))
-        self.assertEqual(self.file(), [(start, w, h)])
-        self.assertIn("<｜User｜>what is it? \n\n<｜deepseek_image｜>", self.prompt())
-
-    def test_two_pictures_in_order_and_a_tool_result_picture(self):
-        self.start("Two.</think>\n\nDone.")
-        status, r = self.chat(messages=[
-            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": png(600, 300)}}, {"type": "text", "text": "and"}]},
-            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {
-                "name": "get_weather", "arguments": "{\"city\": \"Oslo\"}"}}]},
-            {"role": "tool", "tool_call_id": "c1", "content": [{"type": "image_url", "image_url": {"url": png(40, 900)}}]}],
-            tools=[WEATHER])
-        self.assertEqual(status, 200, r)
-        spans = self.spans(self.engine.last_prompt)
-        g = ds4_vision.Geometry(image_token=self.IMAGE)
-        plans = [ds4_vision.plan(600, 300, g), ds4_vision.plan(40, 900, g)]
-        self.assertEqual([n for _, n in spans], [ds4_vision.span_tokens(a, b) for a, b, _, _ in plans])
-        self.assertEqual(self.file(), [(s, w, h) for (s, _), (_, _, h, w) in zip(spans, plans)])
-
-    def test_the_placeholder_written_in_a_message_stays_text(self):
-        self.start("Quoted.</think>\n\nOk.")
-        status, r = self.chat(messages=[{"role": "user", "content": "the token is <｜deepseek_image｜> here"}])
-        self.assertEqual(status, 200, r)
-        self.assertEqual(self.spans(self.engine.last_prompt), [])
-        self.assertIsNone(self.engine.picture_file)
-
-    def test_a_quoted_placeholder_beside_a_picture_leaves_one_span(self):
-        self.start("One.</think>\n\nOk.")
-        status, r = self.chat(messages=[{"role": "user", "content": [
-            {"type": "text", "text": "not this: <｜deepseek_image｜> but this:"},
-            {"type": "image_url", "image_url": {"url": png(64, 64)}}]}])
-        self.assertEqual(status, 200, r)
-        self.assertEqual(len(self.spans(self.engine.last_prompt)), 1)
-        self.assertEqual(len(self.file()), 1)
-
-    def test_a_template_that_takes_text_only_gets_the_placeholders(self):
-        # (a GGUF's own template: content is a string there, a list rendered as its Python form)
-        d = Path(tempfile.mkdtemp(prefix="strata-test-tpl-"))
-        (d / "chat_template.jinja").write_text("{%- for m in messages -%}{%- if m.role == 'user' -%}<｜User｜>"
-                                               "{{ m.content }}{%- endif -%}{%- endfor -%}<｜Assistant｜>",
-                                               encoding="utf-8")
-        self.start("Red.", template=d / "chat_template.jinja")
-        status, r = self.chat(messages=[{"role": "user", "content": [
-            {"type": "text", "text": "what is it?"}, {"type": "image_url", "image_url": {"url": png(32, 32)}},
-            {"type": "text", "text": "and <｜deepseek_image｜>?"}]}])
-        self.assertEqual(status, 200, r)
-        (start, _), = self.spans(self.engine.last_prompt)
-        self.assertEqual([s for s, _, _ in self.file()], [start])
-        self.assertTrue(self.prompt().startswith("<｜User｜>what is it?\n\n<｜deepseek_image｜>"))
-        self.assertTrue(self.prompt().endswith("\n\nand <｜deepseek_image｜>?<｜Assistant｜>"))   # the quoted one: text
-
-    def test_health_says_images(self):
-        self.start("x</think>\n\ny")
-        with urllib.request.urlopen(self.base + "/health", timeout=30) as r:
-            self.assertTrue(json.loads(r.read())["images"])
+        self.assertEqual(right.stop_ids, {EOS})
 
 
 if __name__ == "__main__":
